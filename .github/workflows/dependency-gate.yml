@@ -1,0 +1,99 @@
+# Per-PR dependency gate.
+# Enforce org-wide with an organization ruleset -> "Require workflows to pass before merging",
+# pointing at this file in the central `dependency-gate` repository.
+name: Dependency gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  merge_group: # needed if any repo uses a merge queue; the PR was already gated
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+  id-token: write # only used to assume the package repository role (DEP_GATE_PKG_REPO_ROLE_ARN); nothing happens without it
+
+concurrency:
+  group: dependency-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Skip merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "Gate is enforced on the pull request; nothing to do in the merge queue."
+
+      - name: Fail clearly when the gate credentials are unavailable
+        if: github.event_name == 'pull_request'
+        env:
+          DEP_GATE_APP_PRIVATE_KEY: ${{ secrets.DEP_GATE_APP_PRIVATE_KEY }}
+          DEP_GATE_APP_ID: ${{ vars.DEP_GATE_APP_ID }}
+        run: |
+          if [ -z "$DEP_GATE_APP_PRIVATE_KEY" ] || [ -z "$DEP_GATE_APP_ID" ]; then
+            echo "::error title=Dependency gate::The gate GitHub App credentials (DEP_GATE_APP_ID / DEP_GATE_APP_PRIVATE_KEY) are not available to this run, so the gate cannot evaluate this PR. Contact the dependency gate owners."
+            exit 1
+          fi
+
+      # Short-lived token for checkout and authorized age-exception team checks.
+      # Its API quota is separate from any user's.
+      - name: Create gate App token
+        id: gate-token
+        if: github.event_name == 'pull_request'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.DEP_GATE_APP_ID }}
+          private-key: ${{ secrets.DEP_GATE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: code-dependency-gate
+          permission-contents: read
+          permission-members: read
+
+      - name: Check out gate script
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ vars.DEP_GATE_REPO || format('{0}/code-dependency-gate', github.repository_owner) }}
+          token: ${{ steps.gate-token.outputs.token }}
+          path: .dependency-gate
+          persist-credentials: false
+
+      # Optional: credentials to ask the central package repository which versions are approved (README, "Package repository
+      # check"). Does nothing unless the mode and the role are configured. Dependabot runs cannot request an OIDC token, so a
+      # failure here is not fatal: the gate then reports the repository as unreachable (and in enforce mode blocks).
+      - name: AWS credentials for the package repository
+        if: github.event_name == 'pull_request' && vars.DEP_GATE_PKG_REPO_ROLE_ARN != '' && vars.DEP_GATE_PKG_REPO_MODE != '' && vars.DEP_GATE_PKG_REPO_MODE != 'off'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.DEP_GATE_PKG_REPO_ROLE_ARN }}
+          aws-region: ${{ vars.DEP_GATE_PKG_REPO_REGION || 'eu-west-1' }}
+          role-session-name: dependency-gate
+
+      - name: Evaluate dependency changes
+        if: github.event_name == 'pull_request'
+        env:
+          # GITHUB_TOKEN handles labels/comments; the App token verifies approver team membership.
+          GITHUB_TOKEN: ${{ github.token }}
+          DEP_GATE_TEAM_TOKEN: ${{ steps.gate-token.outputs.token }}
+          DEP_GATE_LABEL: ${{ vars.DEP_GATE_LABEL || 'dependency-scan-approved' }}
+          DEP_GATE_APPROVER_TEAM: ${{ vars.DEP_GATE_APPROVER_TEAM || format('{0}/code-dependency-approvers', github.repository_owner) }}
+          # Minimum age of a new dependency version in days (default 3, 0 disables), and a comma-separated
+          # allowlist of internal packages to skip, e.g. "@acuris/*,@mergermarket/*,mergermarket/*".
+          DEP_GATE_MIN_AGE_DAYS: ${{ vars.DEP_GATE_MIN_AGE_DAYS }}
+          DEP_GATE_AGE_ALLOWLIST: ${{ vars.DEP_GATE_AGE_ALLOWLIST }}
+          DEP_GATE_PRIVATE_INDEXES: ${{ vars.DEP_GATE_PRIVATE_INDEXES }}
+          DEP_GATE_SECURITY_FIX_BYPASS: ${{ vars.DEP_GATE_SECURITY_FIX_BYPASS }}
+          # Central package repository: off (default), report or enforce, and the submit function URL (an output of
+          # iona-central-package-repository).
+          DEP_GATE_PKG_REPO_MODE: ${{ vars.DEP_GATE_PKG_REPO_MODE }}
+          DEP_GATE_PKG_REPO_SUBMIT_URL: ${{ vars.DEP_GATE_PKG_REPO_SUBMIT_URL }}
+        run: |
+          python3 .dependency-gate/dep_gate.py --comment pr \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --event-action "${{ github.event.action }}"
